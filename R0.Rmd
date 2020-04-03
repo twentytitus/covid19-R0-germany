@@ -1,0 +1,565 @@
+---
+title: "Estimating the effective R0 of COVID-19 based on regional data for Germany"
+author: "Titus Laska, Michael Höhle"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 2
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(R0)
+library(EpiEstim)
+library(tidyverse)
+```
+
+**Disclaimer**
+
+*This is work in progress, suggestions welcome!*
+
+<!-- # Load and prepare data -->
+
+```{r}
+# COVID19 data for Germany by RKI through Arcgis
+needs_download <- (!file.exists(file.path("non-git","RKI_COVID19.csv"))) ||
+  (as.Date(file.info(file.path("non-git","RKI_COVID19.csv"))$ctime) != Sys.Date())
+data_url <- if (needs_download) {
+  "https://opendata.arcgis.com/datasets/dd4580c810204019a7b8eb3e0b329dd6_0.csv"
+} else {
+  file.path("non-git","RKI_COVID19.csv")
+}
+covid19 <- read.csv(data_url, stringsAsFactors = FALSE)
+if (needs_download) write.csv(covid19, file.path("non-git","RKI_COVID19.csv"))
+
+stopifnot(length(unique(paste0(covid19$IdLandkreis, covid19$Landkreis))) ==
+            length(unique(covid19$IdLandkreis)))
+stopifnot(grepl("T00:00:00.000Z$", covid19$Meldedatum))
+
+covid19 <- covid19 %>%
+  mutate(Meldedatum = as.Date(Meldedatum))
+
+# If there are less than five cases with unknown Landkreis and Bundesland,
+# we simply drop them and warn. Otherwise we fail.
+unknown_location <- covid19$AnzahlFall + covid19$AnzahlTodesfall > 0 &
+  grepl("nicht erhoben", paste0(covid19$Landkreis, covid19$Bundesland))
+if (any(unknown_location)) {
+  stopifnot(sum(unknown_location) <= 5L)
+  covid19 <- filter(covid19, !unknown_location)
+  warning(sum(unknown_location), " cases with unknown location removed")
+}
+
+# Some case counts are negative (-1)!
+# TODO: What does that mean?
+# We simply set them to 0 for now
+# covid19$AnzahlFall[covid19$AnzahlFall < 0] <- 0
+# covid19$AnzahlTodesfall[covid19$AnzahlTodesfall < 0] <- 0
+
+# hoehle: Vorschlag - stay in the tidyverse?
+# Small helper function to fix negative values to zero
+negative_to_zero <- function(x) if_else(x < 0, 0L, x)
+# Fix negative entries
+covid19 <- covid19 %>% mutate(AnzahlFall = negative_to_zero(AnzahlFall))
+covid19 <- covid19 %>% mutate(AnzahlTodesfall = negative_to_zero(AnzahlTodesfall))
+
+# We remove the few available data prior to February 15th
+# This avoids very large gaps in the data
+covid19 <- filter(covid19, Meldedatum >= "2020-02-15")
+```
+
+<!-- ## Reshape data -->
+
+```{r}
+# reshape covid19 data
+# we need a helper function that inserts zeros for the days without cases to
+# get times series vectors where each index step means one day
+make_equidistant_time_series <- function (counts, dates) {
+  stopifnot(length(dates) == length(counts))
+  stopifnot(length(dates) == length(unique(dates)))
+  all_dates <- seq(min(dates), max(dates), by = 1)
+  all_counts <- setNames(rep(0L, length(all_dates)), all_dates)
+  all_counts[as.character(dates)] <- as.integer(counts)
+  all_counts
+}
+case_vectors <- covid19 %>%
+  group_by(Bundesland, Meldedatum) %>%
+  summarise(cases = sum(AnzahlFall), deaths = sum(AnzahlTodesfall)) %>%
+  group_modify(
+    ~ tibble(
+      cases = list(make_equidistant_time_series(.x$cases, .x$Meldedatum)),
+      deaths = list(make_equidistant_time_series(.x$deaths, .x$Meldedatum))
+    )
+  )
+cases_list <- case_vectors$cases
+```
+
+
+## Generation time distribution
+
+A basis for all the estimates in the document is the assumed generation time
+distribution. Since the start of infectiousness is much more difficult to
+measure than symptom onset, only information on serial intervals is
+available. Moreover, our data is probably more close to reflecting symptom
+onset than beginning of infectiousness (only the reporting date is available).
+
+This is adequate for diseases for which infectiousness starts with symptom
+onset `(Cori et al. 2013)`. For COVID19, however, patients can be infectious
+even before the day of symptom onset. Even negative serial have been observed,
+suggesting a normal distribution of serial intervals `(Du et al. 2020)`.
+`(Cori et al. 2013)` suggest "to back-calculate the incidence of infections
+from the incidence of symptoms and then apply our method to estimate the
+reproduction number from those inferred data". As we do not do this here, the
+following can only be an approximation. 
+
+A discrete generation time distribution is contructed from a gamma distribution
+with specified mean and standard deviation. Mean and standard deviation are
+taken from literature on serial intervals of COVID19. Note again, that a normal
+distribution could just be more accurate here.
+
+We use two different choices:
+
+- **A** is from `(Du et al. 2020)`
+
+- **B** is from `(Nishiura et al. 2020)` and was used by
+https://cmmid.github.io/topics/covid19/current-patterns-transmission/global-time-varying-transmission.html
+
+See also https://github.com/dirkschumacher/covid-19-indicators for a list of
+literature on the topic.
+
+```{r echo = TRUE}
+gt_du <- c(mean = 3.96, sd = 4.75)
+gt_ni <- c(mean = 4.70, sd = 2.90)
+```
+
+The resulting discrete distributions look as follows (for `R0`, `EpiEstim` may
+vary due to a different discretization):
+
+```{r fig.height=3, fig.width=4}
+gt_du_R0 <- generation.time("gamma", gt_du, truncate = 40) # same truncation
+gt_ni_R0 <- generation.time("gamma", gt_ni, truncate = 40) # for better plots
+plot(gt_du_R0)
+plot(gt_ni_R0)
+gt_du_R0 <- generation.time("gamma", gt_du)
+gt_ni_R0 <- generation.time("gamma", gt_ni)
+```
+
+# R0 from exponential growth
+
+We will use the COVID-19 data provided by the RKI as part of their COVID-19
+Dashboard. The data contain the daily number of COVID-19 reports for each
+district and age-group. We will ignore the age-aspect in this analysis and will
+aggregate data to federal state level.
+
+## Time frames of exponential growth
+
+In order to estimate R0, we need to find adequate timeframes of exponential
+growth in the data.
+
+We start with the following maximal admissible time span:
+
+- **Start date:** *The day after the last day with zero cases*
+
+- **End date:** *2020-03-20* – Reasoning: Interventions started somewhere
+between March 9 and March 16. We assume that they took some effect around
+March 13, and add five days for the incubation time and two days for testing
+and reporting to local authorities.
+
+For our analysis we will use the R package
+[R0](https://cran.r-project.org/web/packages/R0/index.html), which is documented
+in `(Obadia et al. 2012)`.
+
+A sensitivity analysis is performed with respect to different time spans
+contained in this maximal time span (incrementing or decrementing the start and
+end dates, respectively).
+
+```{r echo = TRUE, message = FALSE, warning = FALSE}
+find_timeframe <- setNames(lapply(list(gt_du_R0, gt_ni_R0), function (gt) {
+  setNames(lapply(
+    cases_list,
+    function(cases) {
+      first_date_with_cases <- as.integer(rev(which(cases == 0))[1] + 1)
+      if (is.na(first_date_with_cases)) first_date_with_cases <- 1L
+      begin_vector <- first_date_with_cases + 0:3
+      end_vector <- which(names(cases) == "2020-03-20") + -3:0
+      overlapping <- begin_vector >= end_vector
+      R0::sensitivity.analysis(
+        cases,
+        GT = gt,
+        begin = begin_vector,
+        end = end_vector,
+        est.method = "EG",
+        sa.type = "time"
+      )
+    }
+  ), case_vectors$Bundesland)
+}), c("Du", "Nishiura"))
+```
+
+## Results {.tabset .tabset-fade}
+
+```{r}
+min_days <- 7
+```
+
+We choose the time frame with the highest R squared value from the sensitivity
+analysis, but exclude time frames of less than `r min_days` days.
+
+Entries with low `Rsquared` should not be trusted.
+
+```{r}
+make_R0_df <- function (R0_list, gt) {
+  bind_cols(
+    Bundesland = names(R0_list),
+    bind_rows(lapply(
+      R0_list, function(x) x$df.clean %>%
+        filter(if (any(Time.period >= min_days)) Time.period >= min_days else
+          Time.period == max(Time.period)) %>%
+        filter(Rsquared == max(Rsquared))
+    ))
+  ) %>% mutate(GenerationTime = gt)
+}
+R0_expgrowth <- bind_rows(
+  make_R0_df(find_timeframe[[1]], "A"),
+  make_R0_df(find_timeframe[[2]], "B")
+) %>% arrange(Bundesland, GenerationTime)
+```
+
+### Generation time distribution A
+
+```{r}
+rsq_thres <- 0.85
+```
+
+Only contains Bundeslaender for which `Rsquared` is above `r rsq_thres`.
+
+(Reminder: mean: `r gt_du['mean']`, sd: `r gt_du['sd']`)
+
+```{r}
+R0_expgrowth %>%
+  filter(Rsquared > rsq_thres, GenerationTime == "A") %>%
+  transmute(Bundesland, R0 = R, CI.lower, CI.upper, Rsquared) %>%
+  knitr::kable()
+```
+
+### Generation time distribution B
+
+Only contains Bundeslaender for which `Rsquared` is above
+`r (rsq_thres <- 0.85)`.
+
+(Reminder: mean: `r gt_ni['mean']`, sd: `r gt_ni['sd']`)
+
+```{r}
+R0_expgrowth %>%
+  filter(Rsquared > rsq_thres, GenerationTime == "B") %>%
+  transmute(Bundesland, R0 = R, CI.lower, CI.upper, Rsquared) %>%
+  knitr::kable()
+```
+
+Please also use the plots for verifying that the time frame selected by our
+very heuristic choice seems adequate.
+
+### Detailed results
+
+Each Bundesland gets two results, one for each assumption on the generation
+time.
+
+```{r}
+knitr::kable(R0_expgrowth)
+```
+
+### Plots
+
+Case counts by date for each Bundesland.
+
+**Red line** = day of interventions of national government (see above)
+
+**Light blue area** = Select time frame of exponential growth
+
+```{r fig.height=7, fig.width=9}
+covid19 %>%
+  group_by(Bundesland, Meldedatum) %>%
+  summarise(AnzahlFall = sum(AnzahlFall)) %>%
+  ungroup() %>%
+  left_join(select(R0_expgrowth, Bundesland, Begin.dates, End.dates),
+            by = "Bundesland") %>%
+  ggplot() +
+  geom_rect(aes(xmin = Begin.dates, xmax = End.dates), ymin = 0, ymax = Inf,
+            fill = "lightblue", alpha = 0.3) +
+  geom_line(aes(x = Meldedatum, y = AnzahlFall), color = "#4040FF", size = .5) +
+  geom_vline(xintercept = as.Date("2020-03-20"), color = "red") +
+  facet_wrap(facets = ~Bundesland, scales = "free_y")
+```
+
+We see that for some Bundeslaender, notably Bremen, Sachsen-Anhalt, and
+Mecklenburg-Vorpommern, our analysis strategy fails.
+
+<!--
+## Heatmaps for R0 depending on choice of time interval
+
+The dot marks the chosen value by the R squared criterion. It may differ from
+the one in the table above, since we imposed a minimum length of time frame
+there.
+-->
+
+```{r eval=FALSE, results='hide'}
+mapply(
+  function(x, name) {
+    p <- tryCatch(plot(x, what="heatmap"),
+                  error = function(e) message("Plot error"))
+    message(name)
+    p
+  },
+  find_timeframe,
+  names(find_timeframe)
+)
+```
+
+
+# Time dependent R
+
+## Using method "TD" of the R0 package
+
+The function `R0::est.R0.TD` implements a method by
+`Wallinga and Teunis (2004)`. See package documentation for details. Unlike
+`EpiEstim::wallinga_teunis`, it provides some correction for cases not yet
+observed, leading to higher values of R0 close to the present days
+(approx. +0.5). This appears more realistic.
+
+```{r echo = TRUE, message = FALSE, warning = FALSE}
+time_dependent_R <- setNames(lapply(list(gt_du_R0, gt_ni_R0), function (gt) {
+  setNames(lapply(
+    cases_list,
+    function(cases) {
+      message("+")
+      R0::est.R0.TD(
+        cases,
+        GT = gt,
+        begin = which(names(cases) >= "2020-03-01")[1], # not used
+        end = rev(which(names(cases) <= as.character(   # (only for plotting)
+          max(covid19$Meldedatum) - 3)))[1],
+        correct = TRUE # Does make a big difference (> +0.5 close to present)
+      )
+    }
+  ), case_vectors$Bundesland)
+}), c("Du", "Nishiura"))
+```
+
+```{r}
+# # method "BS"
+# tryCatch(R0::est.R0.SB(
+#   cases,
+#   GT = gt,
+#   begin = which(names(cases) >= "2020-03-01")[1],
+#   end = rev(which(names(cases) <= as.character(
+#     max(covid19$Meldedatum) - 3)))[1]
+# ), error = function(x) NA)
+```
+
+
+```{r fig.height=7, fig.width=9}
+make_R0_td_df <- function (R0_td_list, gt) {
+  the_list <- lapply(R0_td_list, function(res)
+    mutate(cbind(R = res$R, res$conf.int), Meldedatum = as.Date(names(res$R))))
+  bind_rows(
+    mapply(mutate, the_list, Bundesland = names(the_list), SIMPLIFY = FALSE)
+  ) %>% mutate(GenerationTime = gt)
+}
+R0_td <- bind_rows(
+  make_R0_td_df(time_dependent_R[[1]], "A"),
+  make_R0_td_df(time_dependent_R[[2]], "B")
+) %>% arrange(Bundesland, GenerationTime)
+```
+
+## Using the EpiEstim package
+
+The function `EpiEstim::estimate_R` in the R package
+[`EpiEstim`](https://cran.r-project.org/web/packages/EpiEstim/index.html), see
+`(Cori et al. 2013)` for an introduction, provides for a way to cope with some
+uncertainty regarding the serial interval distribution.
+
+It might be good to extract some more information on variability of the
+serial intervals from literature. For now, we follow a naive approach.
+
+The estimation uses sliding windows of seven days length.
+
+```{r echo = TRUE, message = FALSE, warning = FALSE}
+time_dependent_R_epiestim <- setNames(lapply(list(gt_du, gt_ni), function (gt) {
+  setNames(lapply(
+    cases_list,
+    function(cases) {
+      message("+")
+      c(
+        EpiEstim::estimate_R(
+          cases,
+          method = "uncertain_si",
+          config = make_config(list(
+            mean_si = gt["mean"], std_mean_si = 1,
+            min_mean_si = gt["mean"] - 2, max_mean_si = gt["mean"] + 2,
+            std_si = gt["sd"], std_std_si = 0.5,
+            min_std_si = gt["sd"] - 1, max_std_si = gt["sd"] + 1,
+            n1 = 100, n2 = 100
+          ))
+        ),
+        date_map = list(as.Date(names(cases)))
+      )
+    }
+  ), case_vectors$Bundesland)
+}), c("Du", "Nishiura"))
+```
+
+The method involves the sampling of `n1` serial interval distributions. As an
+illustration, we plot the different serial interval distributions that were used
+in the estimation for Berlin (case A on the left, case B on the right).
+
+```{r fig.height=4, fig.width=4}
+estimate_R_plots(time_dependent_R_epiestim$Du$Berlin, what = "SI") +
+  coord_cartesian(xlim = c(0, 20))
+estimate_R_plots(time_dependent_R_epiestim$Nishiura$Berlin, what = "SI") +
+  coord_cartesian(xlim = c(0, 20))
+```
+
+Note that the function still warns us (as of April 2 for five Bundeslaender):
+
+> You're estimating R too early in the epidemic to get the desired posterior CV.
+
+Also warnings about serial interval distributions not summing to one appear,
+which is also due to too short a time span for which we have data, given the
+possibly long serial intervals (depending on the choice of parameters).
+
+*Use results with care!*
+
+```{r}
+# EpiEstim::wallinga_teunis(
+#   cases, method ="parametric_si", config = list(
+#     t_start = seq(2, length(cases)), t_end = seq(2, length(cases)),
+#     mean_si = 3.96, std_si = 4.75, n_sim = 100
+#   )
+# ),
+```
+
+```{r}
+make_epiestim_df <- function (R0_td_list, gt) {
+  the_list <- lapply(R0_td_list, function(res)
+    transmute(
+      res$R, Meldedatum = res$date_map[t_end] - 3,
+      R = `Mean(R)`, lower = `Quantile.0.025(R)`, upper = `Quantile.0.975(R)`
+    )
+  )
+  bind_rows(
+    mapply(mutate, the_list, Bundesland = names(the_list), SIMPLIFY = FALSE)
+  ) %>% mutate(GenerationTime = gt)
+}
+epiestim <- bind_rows(
+  make_epiestim_df(time_dependent_R_epiestim[[1]], "A"),
+  make_epiestim_df(time_dependent_R_epiestim[[2]], "B")
+) %>% arrange(Bundesland, GenerationTime)
+```
+
+## Results {.tabset .tabset-fade}
+
+Note that in the following plots, for EpiEstim, `Meldedatum` is the fourth day
+of the seven day long sliding window of the analyses.
+
+Results are plotted until three days before the date of the most recent case
+reported in order to avoid problems related to reporting delays.
+
+```{r}
+td_R_df <-
+  bind_rows(
+    mutate(epiestim, method = "EpiEstim::estimate_R"),
+    mutate(R0_td, method = "R0::est.R0.TD")
+  ) %>% mutate(method = forcats::fct_rev(as.factor(method)))
+
+make_td_r_plot <- function (df) {
+  ggplot(df) +
+    geom_ribbon(aes(x = Meldedatum, ymin = lower, ymax = upper,
+                    fill = method)) +
+    geom_line(aes(x = Meldedatum, y = R, color = method)) +
+    geom_hline(yintercept = 1, color = "red") +
+    xlim(c(as.Date("2020-03-01"), max(covid19$Meldedatum) - 3)) +
+    scale_color_manual(values = c("#A0A0A0", "#4040FF")) +
+    scale_fill_manual(values = c("#E0E0E0", "#B0B0FF")) +
+    coord_cartesian(ylim = c(0, 6)) +
+    facet_wrap(~Bundesland) +
+    theme(legend.position = "bottom", legend.direction = "horizontal")
+}
+```
+
+### Generation time distribution A
+
+(Reminder: mean: `r gt_du['mean']`, sd: `r gt_du['sd']`)
+
+```{r fig.height=6, fig.width=9}
+make_td_r_plot(filter(td_R_df, GenerationTime == "A"))
+```
+
+### Generation time distribution B
+
+(Reminder: mean: `r gt_ni['mean']`, sd: `r gt_ni['sd']`)
+
+```{r fig.height=6, fig.width=9}
+make_td_r_plot(filter(td_R_df, GenerationTime == "B"))
+```
+
+### Berlin A
+
+(Reminder: mean: `r gt_du['mean']`, sd: `r gt_du['sd']`)
+
+```{r fig.height=6, fig.width=9}
+make_td_r_plot(filter(td_R_df, GenerationTime == "A", Bundesland == "Berlin"))
+```
+
+### Berlin B
+
+(Reminder: mean: `r gt_ni['mean']`, sd: `r gt_ni['sd']`)
+
+```{r fig.height=6, fig.width=9}
+make_td_r_plot(filter(td_R_df, GenerationTime == "B", Bundesland == "Berlin"))
+```
+
+
+# Limitations
+
+- Data is by date of notification, not by date of infection. The correction
+used for this is extremely rudimentary
+
+- Under-reporting: Not everybody is tested, people can have COVID-19 with little
+or no symptoms
+
+- Not enough data for time dependent method, especially with weekly sliding
+windows
+
+- Limited knowledge on serial interval distribution; problems related to
+pre-symptomatic infectiousness
+
+- The "discussion" section in `(Cori et al 2013)` is a good read!
+
+- ...
+
+
+# Bibliography
+
+Du Z, Xu X, Wu Y, Wang L, Cowling BJ, Ancel Meyers L. *Serial interval of
+COVID-19 among publicly reported confirmed cases*. Emerg Infect Dis. Jun 2020,
+https://doi.org/10.3201/eid2606.200357
+
+Cori, A., Ferguson, N., Fraser, Chr. & Cauchemez, S. *A New Framework and
+Software to Estimate Time-Varying Reproduction Numbers During Epidemics*.
+American Journal of Epidemiology, Volume 178, Issue 9, 1 November 2013,
+1505–1512, https://doi.org/10.1093/aje/kwt133
+
+Nishiura H, Linton NM, Akhmetzhanov AR. Serial interval of novel coronavirus
+(COVID-19) infections. Int J Infect Dis, 4 March 2020, 93, 284-286,
+https://doi.org/10.1016/j.ijid.2020.02.060
+
+Obadia, T., Haneef, R. & Boëlle, P. *The R0 package: a toolbox to estimate
+reproduction numbers for epidemic outbreaks*. BMC Med Inform Decis Mak 12, 147
+(2012). https://doi.org/10.1186/1472-6947-12-147
+
+Wallinga, J., Teunis, P. *Different Epidemic Curves for Severe Acute
+Respiratory Syndrome Reveal Similar Impacts of Control Measures*. American
+Journal of Epidemiology, Volume 160, Issue 6, 15 September 2004, 509–516,
+https://doi.org/10.1093/aje/kwh255
