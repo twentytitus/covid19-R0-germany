@@ -60,7 +60,7 @@ if (any(unknown_location)) {
 
 # hoehle: Vorschlag - stay in the tidyverse?
 # Small helper function to fix negative values to zero
-negative_to_zero <- function(x) if_else(x < 0, 0L, x)
+negative_to_zero <- function(x) ifelse(x < 0, 0, x)
 # Fix negative entries
 covid19 <- covid19 %>% mutate(AnzahlFall = negative_to_zero(AnzahlFall))
 covid19 <- covid19 %>% mutate(AnzahlTodesfall = negative_to_zero(AnzahlTodesfall))
